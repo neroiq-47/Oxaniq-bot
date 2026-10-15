@@ -1,6 +1,7 @@
 """Oxaniq main agent loop — paper-first with MTM exits, TG ops, feed status."""
 
 from __future__ import annotations
+from pathlib import Path
 from urllib.parse import quote
 import html
 import asyncio
@@ -51,6 +52,7 @@ class OxaniqAgent:
             max_dev_buy_sol=getattr(self.config, "max_dev_buy_sol", 2.0),
         )
         self.call_mode = getattr(self.config, "call_mode", "trade")
+        self.pending_buys = {}
         self.live = None  # set after helius
         self.ingester = PumpFunIngester(self.config)
         self.vybe = VybeClient(self.config)
@@ -108,26 +110,50 @@ class OxaniqAgent:
             ]
         }
 
+    def _httpize(self, url: str) -> str:
+        url = (url or "").strip()
+        if url.startswith("ipfs://"):
+            return "https://ipfs.io/ipfs/" + url[len("ipfs://"):]
+        return url
+
     async def _coin_image(self, token) -> str:
         raw = token.raw or {}
-        img = token.image_uri or raw.get("image") or raw.get("image_uri") or ""
-        if isinstance(img, str) and img.startswith("http"):
-            return img
-        uri = raw.get("uri") or ""
-        if isinstance(uri, str) and uri.startswith("http") and any(uri.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
-            return uri
-        if isinstance(uri, str) and uri.startswith("http"):
+        candidates = [
+            token.image_uri,
+            raw.get("image"),
+            raw.get("image_uri"),
+            raw.get("imageUri"),
+            (raw.get("vybe") or {}).get("logoURI") if isinstance(raw.get("vybe"), dict) else None,
+            (raw.get("vybe") or {}).get("image") if isinstance(raw.get("vybe"), dict) else None,
+        ]
+        uri = raw.get("uri") or raw.get("metadataUri") or ""
+        uri = self._httpize(uri)
+        if uri.startswith("http") and any(uri.lower().split("?")[0].endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            candidates.insert(0, uri)
+        elif uri.startswith("http"):
             try:
                 import aiohttp
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(uri, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                        if r.status == 200 and "json" in (r.headers.get("content-type") or ""):
-                            meta = await r.json()
-                            pic = meta.get("image") or ""
-                            if isinstance(pic, str) and pic.startswith("http"):
-                                return pic
-            except Exception:
-                pass
+                    async with s.get(uri, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        if r.status == 200:
+                            text = await r.text()
+                            try:
+                                import json
+                                meta = json.loads(text)
+                                pic = meta.get("image") or meta.get("image_uri") or ""
+                                if pic:
+                                    candidates.insert(0, pic)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug(f"meta fetch fail: {e}")
+        # DexScreener image fallback
+        if token.mint:
+            candidates.append(f"https://dd.dexscreener.com/ds-data/tokens/solana/{token.mint}.png")
+        for pic in candidates:
+            pic = self._httpize(pic or "")
+            if pic.startswith("http"):
+                return pic
         return ""
 
     def _pay_keyboard(self) -> dict:
@@ -153,19 +179,16 @@ class OxaniqAgent:
 
     def _welcome_text(self) -> str:
         return (
-            "<b>OxanIQ</b> — Solana call desk\n"
-            "<i>Pump.fun launches. Scored. Capped. Shared.</i>\n\n"
-            "<b>How it works</b>\n"
-            "1. Live feed watches new launches\n"
-            "2. Score + risk gates filter the noise\n"
-            "3. Calls land here with chart links\n\n"
-            "<b>Free desk</b>\n"
-            "Calls, status, feed, and your wallet are free.\n"
-            "1 Jupiter quote a day.\n\n"
-            "<b>Unlock</b>\n"
-            "/pay — $11.99 in SOL, one time.\n"
-            "Unlimited quotes, withdraws, and the full desk.\n\n"
-            "Tap /help for commands."
+            "<b>OXANIQ</b>\n"
+            "#Solana #Memecoins\n"
+            "new pump launches. scored. posted. no cap on the chaos.\n\n"
+            "live feed watches creates\n"
+            "vybe checks holders\n"
+            "calls hit the group and the channel with chart links\n\n"
+            "watch for free\n"
+            "/pay $11.99 once to unlock quotes + withdraws\n\n"
+            "/help if you get lost\n\n"
+            "<i>Not financial advice. You can lose it all. DYOR.</i>"
         )
 
     def _help_text(self) -> str:
@@ -223,7 +246,15 @@ class OxaniqAgent:
         self.tg.set_command_handler(self._on_tg_command)
         if self.tg.enabled:
             await self.tg.start_polling()
-            await self.tg.send(self._welcome_text(), parse_mode="HTML", reply_markup=self._pay_keyboard())
+            welcome_img = Path(__file__).resolve().parents[2] / "assets" / "welcome.jpg"
+            if welcome_img.exists():
+                await self.tg.send_photo_file(
+                    str(welcome_img),
+                    self._welcome_text(),
+                    reply_markup=self._pay_keyboard(),
+                )
+            else:
+                await self.tg.send(self._welcome_text(), parse_mode="HTML", reply_markup=self._pay_keyboard())
             logger.info("Telegram control enabled")
         await self.ingester.start()
         self.running = True
@@ -261,6 +292,18 @@ class OxaniqAgent:
     async def _mark_price(self, mint: str, tokens_held: float, entry: float) -> Optional[float]:
         if not mint or mint.startswith("Mock"):
             return None
+        # Vybe price first
+        if getattr(self, "vybe", None) and self.vybe.enabled:
+            try:
+                info = await self.vybe.token(mint)
+                px = (info or {}).get("price")
+                if px and float(px) > 0 and entry > 0:
+                    # vybe is USD; keep relative move via entry ratio only if we have SOL price
+                    sol = (await self.vybe.token("So11111111111111111111111111111111111111112") or {}).get("price")
+                    if sol and float(sol) > 0:
+                        return float(px) / float(sol)
+            except Exception:
+                pass
         try:
             amt = max(1, int(tokens_held))
             if amt > 10**15:
@@ -337,10 +380,15 @@ class OxaniqAgent:
                 f" · <b>Top10</b> {self._esc(round(float((tok.raw or {}).get('top10_holder_pct') or 0), 1) if (tok.raw or {}).get('top10_holder_pct') else 'n/a')}%\n"
                 f"<b>Mint</b> <code>{self._esc(tok.mint)}</code>\n"
                 f"<b>Mode</b> {self._esc(self.call_mode)} · <b>Left</b> {left}\n\n"
-                f"<i>Free to watch. /pay unlocks quotes + withdraws.</i>"
+                f"<i>Free to watch. /pay unlocks quotes + withdraws.</i>\n"
+                f"<i>Not financial advice. DYOR.</i>"
             )
             kb = self._share_keyboard(tok.symbol, tok.mint, call_reason)
             photo = await self._coin_image(tok)
+            if not photo:
+                logger.info(f"no image for {tok.symbol}")
+            else:
+                logger.info(f"image {tok.symbol} {photo[:80]}")
             await self._alert(call_text, reply_markup=kb, parse_mode="HTML", photo=photo or None, also_channel=True)
             if self.call_mode != "trade":
                 continue
@@ -365,7 +413,8 @@ class OxaniqAgent:
                 else:
                     await self._alert(f"LIVE BUY failed {sig.token.symbol}\n{result.get('error')}")
 
-        if self.config.paper_trading and self.portfolio.positions:
+        live_on = (not self.config.paper_trading) and getattr(self.config, "live_enabled", False)
+        if self.portfolio.positions and (self.config.paper_trading or live_on):
             now = datetime.now(timezone.utc)
             r = self.config.risk
             for mint, pos in list(self.portfolio.positions.items()):
@@ -375,10 +424,13 @@ class OxaniqAgent:
                 mark = await self._mark_price(mint, pos.tokens_held, pos.entry_price_sol)
                 if mark is None:
                     if age >= r.max_hold_seconds:
+                        if live_on:
+                            result = await self.live.sell(mint, pos.tokens_held)
+                            await self._alert(f"LIVE SELL {pos.symbol} max_hold\n{result.get('signature') or result.get('error')}")
                         trade = self.executor.execute_sell(
                             mint, 1.0, mark_price=pos.entry_price_sol, reason="max_hold"
                         )
-                        if trade:
+                        if trade and not live_on:
                             await self._alert(f"SELL {pos.symbol} max_hold\nPnL {trade.pnl_sol:+.4f} SOL")
                     continue
                 pct = (mark / pos.entry_price_sol - 1.0) if pos.entry_price_sol > 0 else 0.0
@@ -441,7 +493,14 @@ class OxaniqAgent:
                 await reply("Paid desk only.\n/pay — $11.99 in SOL, one time.\nFree: /status /feed /calls /wallet /quote (1/day)")
                 return
 
-        if cmd0 in ("/help", "/start"):
+        if cmd0 == "/start":
+            welcome_img = Path(__file__).resolve().parents[2] / "assets" / "welcome.jpg"
+            if welcome_img.exists():
+                await self.tg.send_photo_file(str(welcome_img), self._welcome_text(), chat_id=chat_id, reply_markup=self._pay_keyboard())
+            else:
+                await self.tg.send(self._welcome_text(), chat_id=chat_id, parse_mode="HTML", reply_markup=self._pay_keyboard())
+            return
+        if cmd0 == "/help":
             text = self._help_text()
             if admin:
                 text += (
@@ -638,6 +697,40 @@ class OxaniqAgent:
             except Exception as e:
                 await reply(f"Quote failed: {e}")
             return
+        if cmd0 == "/buy":
+            if not args:
+                await reply("Usage: /buy <mint> then /buy confirm")
+                return
+            if args[0].lower() == "confirm":
+                pend = self.pending_buys.get(user_id)
+                if not pend:
+                    await reply("Nothing pending. /buy <mint> first.")
+                    return
+                mint = pend["mint"]
+                size = pend["size"]
+                if self.config.paper_trading or not getattr(self.config, "live_enabled", False):
+                    from src.core.models import TokenInfo, Signal
+                    sig = Signal(token=TokenInfo(mint=mint, name=mint[:6], symbol=mint[:6]), score=0.5, confidence=0.5)
+                    trade = self.executor.execute_buy(sig, size)
+                    self.pending_buys.pop(user_id, None)
+                    if trade:
+                        await reply(f"PAPER BUY {mint[:8]} {trade.size_sol:.4f} SOL")
+                    else:
+                        await reply("Paper buy failed.")
+                    return
+                secret = self.user_wallets.decrypt_secret(user_id)
+                result = await self.live.buy(mint, size, secret=secret)
+                self.pending_buys.pop(user_id, None)
+                if result.get("ok"):
+                    await reply(f"LIVE BUY {mint[:8]}\nsig={result.get('signature')}")
+                else:
+                    await reply(f"Live buy failed: {result.get('error')}")
+                return
+            mint = args[0]
+            size = self.risk.size_position(type("S", (), {"confidence": 0.5, "score": 0.5})())
+            self.pending_buys[user_id] = {"mint": mint, "size": size}
+            await reply(f"Pending buy {mint[:8]} for {size:.4f} SOL.\nReply /buy confirm")
+            return
         if cmd0 == "/pay":
             if not user_id:
                 await reply("Could not read your user id.")
@@ -788,6 +881,17 @@ class OxaniqAgent:
                 f"Send {amt_s} to:\n{self.access.vault}\n\n"
                 f"Then /verify <tx_signature>\n"
                 f"Free desk stays open either way."
+            )
+            return
+        if cmd0 == "/live" and args and args[0].lower() == "ready":
+            st = await self.live.ready()
+            await reply(
+                f"Live ready\n"
+                f"enabled={st['enabled']}\n"
+                f"key={st['key']}\n"
+                f"wallet={st['pubkey']}\n"
+                f"balance={st['balance_sol']}\n"
+                f"vault={st['vault']}"
             )
             return
         if cmd0 in ("/live", "/live_cb", "/cb"):

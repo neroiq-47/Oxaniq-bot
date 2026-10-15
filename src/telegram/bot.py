@@ -125,6 +125,33 @@ class TelegramBot:
         res = await self._call("sendMessage", **payload)
         return res is not None
 
+    async def send_photo_file(self, path: str, caption: str, chat_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: str = "HTML") -> bool:
+        cid = chat_id or self.chat_id
+        if not self.enabled or not cid:
+            return False
+        import aiohttp
+        from pathlib import Path as P
+        data = aiohttp.FormData()
+        data.add_field("chat_id", str(cid))
+        data.add_field("caption", caption[:1000])
+        data.add_field("parse_mode", parse_mode)
+        if reply_markup:
+            import json
+            data.add_field("reply_markup", json.dumps(reply_markup))
+        data.add_field("photo", P(path).read_bytes(), filename="welcome.jpg", content_type="image/jpeg")
+        session = await self._session_get()
+        url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
+        try:
+            async with session.post(url, data=data) as r:
+                body = await r.json()
+                if not body.get("ok"):
+                    logger.warning(f"Telegram sendPhoto file failed: {body}")
+                    return False
+                return True
+        except Exception as e:
+            logger.warning(f"Telegram sendPhoto file error: {e}")
+            return False
+
     async def send_photo(self, photo: str, caption: str, chat_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: str = "HTML") -> bool:
         cid = chat_id or self.chat_id
         if not self.enabled or not cid or not photo:

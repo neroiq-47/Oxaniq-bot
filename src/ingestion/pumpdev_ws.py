@@ -45,7 +45,8 @@ class PumpDevStream:
             virtual_sol_reserves=event.get("vSolInBondingCurve"),
             virtual_token_reserves=event.get("vTokensInBondingCurve"),
             market_cap_sol=event.get("marketCapSol"),
-            raw={**event, "live": True, "source": "pumpdev"},
+            image_uri=event.get("image") or event.get("imageUri"),
+            raw={**event, "live": True, "source": "pumpdev", "uri": event.get("uri")},
         )
 
     async def start(self):

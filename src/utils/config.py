@@ -57,7 +57,7 @@ class OxaniqConfig:
     access_price_usd: float = 11.99
     access_required: bool = True
     free_quotes_per_day: int = 1
-    max_calls_per_day: int = 20
+    max_calls_per_day: int = 300
     min_call_score: float = 0.30
     min_call_confidence: float = 0.28
     call_mode: str = "trade"  # alert | trade
@@ -121,7 +121,7 @@ class OxaniqConfig:
             access_price_usd=float(os.getenv("ACCESS_PRICE_USD", 11.99)),
             access_required=os.getenv("ACCESS_REQUIRED", "true").lower() in ("1", "true", "yes"),
             free_quotes_per_day=int(os.getenv("FREE_QUOTES_PER_DAY", 1)),
-            max_calls_per_day=int(os.getenv("MAX_CALLS_PER_DAY", 20)),
+            max_calls_per_day=int(os.getenv("MAX_CALLS_PER_DAY", 300)),
             min_call_score=float(os.getenv("MIN_CALL_SCORE", 0.30)),
             min_call_confidence=float(os.getenv("MIN_CALL_CONFIDENCE", 0.28)),
             call_mode=os.getenv("CALL_MODE", "trade").lower(),

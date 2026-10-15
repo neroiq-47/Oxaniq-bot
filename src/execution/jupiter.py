@@ -15,8 +15,8 @@ from src.utils.logger import setup_logger
 logger = setup_logger()
 
 # Official Jupiter API endpoints (v6)
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 
 
 class JupiterClient:

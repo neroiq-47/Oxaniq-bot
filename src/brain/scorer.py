@@ -33,7 +33,7 @@ class Scorer:
         # PumpDev create is always fresh
         raw = token.raw or {}
         if raw.get("txType") == "create" or raw.get("source") == "pumpdev":
-            score += 0.12
+            score += 0.20
             reasons.append("PumpDev create")
             if not token.created_timestamp:
                 confidence += 0.05

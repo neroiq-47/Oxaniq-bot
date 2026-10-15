@@ -25,6 +25,8 @@ class CallScanner:
         self.max_curve_sol = max_curve_sol
         self.max_mcap_sol = max_mcap_sol
         self.max_dev_buy_sol = max_dev_buy_sol
+        self.reject_concentrated = True
+        self.max_top10_pct = 50.0
         self.day = ""
         self.used = 0
         self._creator_hits = {}
@@ -78,6 +80,7 @@ class CallScanner:
                 break
             if sig.score < self.min_score:
                 audit("call_rejected", symbol=sig.token.symbol, reason="score", score=sig.score)
+                logger.info(f"reject {sig.token.symbol} score={sig.score:.2f}")
                 continue
             if sig.confidence < self.min_confidence:
                 audit("call_rejected", symbol=sig.token.symbol, reason="confidence", confidence=sig.confidence)
@@ -109,6 +112,14 @@ class CallScanner:
                 dev = 0.0
             if dev > self.max_dev_buy_sol:
                 audit("call_rejected", symbol=sig.token.symbol, reason="dev_buy", dev=dev)
+                continue
+            top10 = (sig.token.raw or {}).get("top10_holder_pct")
+            try:
+                top10_f = float(top10) if top10 is not None else 0.0
+            except Exception:
+                top10_f = 0.0
+            if self.reject_concentrated and top10_f and top10_f > self.max_top10_pct:
+                audit("call_rejected", symbol=sig.token.symbol, reason="concentrated", top10=top10_f)
                 continue
             creator = sig.token.creator or ""
             if creator:

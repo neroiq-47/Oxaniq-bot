@@ -39,6 +39,8 @@ class OxaniqConfig:
     pumpportal_ws: str = "wss://pumpportal.fun/api/data"
     pumpdev_ws: str = "wss://pumpdev.io/ws"
     pumpdev_api_key: Optional[str] = None
+    vybe_api: str = "https://api.vybenetwork.xyz"
+    vybe_api_key: Optional[str] = None
     fomo_api_url: Optional[str] = None
     fomo_api_key: Optional[str] = None
     usdc_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -48,14 +50,16 @@ class OxaniqConfig:
     x402_enabled: bool = False
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
+    telegram_channel_id: Optional[str] = None
     telegram_admin_ids: List[str] = field(default_factory=list)
     platform_fee_bps: int = 50  # 0.5%
     platform_vault: str = "92gMu7MDKw5CuGxGKjUbaDx2BeuFBo9ttUkJSb7yABM1"
     access_price_usd: float = 11.99
     access_required: bool = True
+    free_quotes_per_day: int = 1
     max_calls_per_day: int = 20
-    min_call_score: float = 0.55
-    min_call_confidence: float = 0.50
+    min_call_score: float = 0.30
+    min_call_confidence: float = 0.28
     call_mode: str = "trade"  # alert | trade
     live_enabled: bool = False
     min_curve_sol: float = 2.0
@@ -99,6 +103,8 @@ class OxaniqConfig:
             pumpportal_ws=os.getenv("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"),
             pumpdev_ws=os.getenv("PUMPDEV_WS", "wss://pumpdev.io/ws"),
             pumpdev_api_key=os.getenv("PUMPDEV_API_KEY") or None,
+            vybe_api=os.getenv("VYBE_API", "https://api.vybenetwork.xyz"),
+            vybe_api_key=os.getenv("VYBE_API_KEY") or None,
             fomo_api_url=os.getenv("FOMO_API_URL") or None,
             fomo_api_key=os.getenv("FOMO_API_KEY") or None,
             usdc_mint=os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
@@ -108,14 +114,16 @@ class OxaniqConfig:
             x402_enabled=os.getenv("X402_ENABLED", "false").lower() in ("1", "true", "yes"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+            telegram_channel_id=os.getenv("TELEGRAM_CHANNEL_ID") or os.getenv("TELEGRAM_CHANNEL") or None,
             telegram_admin_ids=admin_ids,
             platform_fee_bps=int(os.getenv("PLATFORM_FEE_BPS", 50)),
             platform_vault=os.getenv("PLATFORM_VAULT", "92gMu7MDKw5CuGxGKjUbaDx2BeuFBo9ttUkJSb7yABM1"),
             access_price_usd=float(os.getenv("ACCESS_PRICE_USD", 11.99)),
             access_required=os.getenv("ACCESS_REQUIRED", "true").lower() in ("1", "true", "yes"),
+            free_quotes_per_day=int(os.getenv("FREE_QUOTES_PER_DAY", 1)),
             max_calls_per_day=int(os.getenv("MAX_CALLS_PER_DAY", 20)),
-            min_call_score=float(os.getenv("MIN_CALL_SCORE", 0.55)),
-            min_call_confidence=float(os.getenv("MIN_CALL_CONFIDENCE", 0.50)),
+            min_call_score=float(os.getenv("MIN_CALL_SCORE", 0.30)),
+            min_call_confidence=float(os.getenv("MIN_CALL_CONFIDENCE", 0.28)),
             call_mode=os.getenv("CALL_MODE", "trade").lower(),
             live_enabled=os.getenv("LIVE_ENABLED", "false").lower() in ("1", "true", "yes"),
             min_curve_sol=float(os.getenv("MIN_CURVE_SOL", 2.0)),

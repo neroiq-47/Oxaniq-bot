@@ -21,6 +21,7 @@ class TelegramBot:
     def __init__(self, config: OxaniqConfig):
         self.token = (config.telegram_bot_token or "").strip()
         self.chat_id = (config.telegram_chat_id or "").strip() or None
+        self.channel_id = (getattr(config, "telegram_channel_id", None) or "").strip() or None
         self.enabled = bool(self.token)
         self._session: Optional[aiohttp.ClientSession] = None
         self._offset = 0
@@ -101,7 +102,7 @@ class TelegramBot:
                 return self.chat_id
         return None
 
-    async def send(self, text: str, chat_id: Optional[str] = None, reply_markup: Optional[dict] = None) -> bool:
+    async def send(self, text: str, chat_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: Optional[str] = None) -> bool:
         cid = chat_id or self.chat_id
         if not self.enabled:
             return False
@@ -117,18 +118,56 @@ class TelegramBot:
             "text": text,
             "disable_web_page_preview": True,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = reply_markup
         res = await self._call("sendMessage", **payload)
+        return res is not None
+
+    async def send_photo(self, photo: str, caption: str, chat_id: Optional[str] = None, reply_markup: Optional[dict] = None, parse_mode: str = "HTML") -> bool:
+        cid = chat_id or self.chat_id
+        if not self.enabled or not cid or not photo:
+            return False
+        payload = {
+            "chat_id": cid,
+            "photo": photo,
+            "caption": caption[:1000],
+            "parse_mode": parse_mode,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        res = await self._call("sendPhoto", **payload)
         return res is not None
 
     def set_command_handler(self, handler: Callable[[str, str], Awaitable[None]]):
         """handler(command, chat_id) e.g. command='/status'."""
         self._on_command = handler
 
+    async def _set_commands(self):
+        commands = [
+            {"command": "help", "description": "Command list"},
+            {"command": "status", "description": "Cash, PnL, open trades"},
+            {"command": "pos", "description": "Open positions"},
+            {"command": "trades", "description": "Recent fills"},
+            {"command": "calls", "description": "Calls used today"},
+            {"command": "feed", "description": "Launch source"},
+            {"command": "wallet", "description": "Your deposit address"},
+            {"command": "balance", "description": "SOL and USDC"},
+            {"command": "pay", "description": "Unlock for $11.99"},
+            {"command": "verify", "description": "Confirm your payment"},
+            {"command": "quote", "description": "Price a mint"},
+            {"command": "health", "description": "RPC status"},
+            {"command": "slot", "description": "Current Solana slot"},
+            {"command": "withdraw", "description": "Send SOL or USDC"},
+            {"command": "live", "description": "Paper or live (admin)"},
+        ]
+        await self._call("setMyCommands", commands=commands)
+
     async def start_polling(self):
         if not self.enabled:
             return
+        await self._set_commands()
         if not self.chat_id:
             await self.discover_chat_id()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="tg-poll")
@@ -156,11 +195,11 @@ class TelegramBot:
                         msgc = cb.get("message") or {}
                         cid = str((msgc.get("chat") or {}).get("id") or "")
                         await self._call("answerCallbackQuery", callback_query_id=cb.get("id"))
-                        if data.startswith("live:"):
+                        if data.startswith("live:") or data.startswith("pay:") or data.startswith("holders:"):
                             try:
-                                await self._on_command("/live_cb", cid, data, uid)
+                                await self._on_command("/cb", cid, data, uid)
                             except TypeError:
-                                await self._on_command("/live_cb", cid, data)
+                                await self._on_command("/cb", cid, data)
                         continue
                     msg = upd.get("message") or {}
                     text = (msg.get("text") or "").strip()

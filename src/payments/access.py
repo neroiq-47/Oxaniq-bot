@@ -20,6 +20,7 @@ class AccessRail:
         self.vault = vault
         self.price_usd = price_usd
         self._paid: Dict[str, Any] = self._load()
+        self._free: Dict[str, Any] = {}
 
     def _load(self) -> Dict[str, Any]:
         if not STORE.exists():
@@ -97,3 +98,16 @@ class AccessRail:
         if found + 1e-6 < min_sol * 0.98:
             return {"ok": False, "error": f"paid {found:.4f} SOL, need {min_sol:.4f}"}
         return {"ok": True, "sol": found}
+
+    def free_quote_ok(self, user_id: str, limit: int = 1) -> bool:
+        from datetime import datetime, timezone
+        uid = str(user_id)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rec = self._free.get(uid) or {}
+        if rec.get("day") != today:
+            rec = {"day": today, "quotes": 0}
+        if rec["quotes"] >= limit:
+            return False
+        rec["quotes"] += 1
+        self._free[uid] = rec
+        return True

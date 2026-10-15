@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from urllib.parse import quote
+import html
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,6 +17,7 @@ from src.brain.scorer import Scorer
 from src.core.call_scanner import CallScanner
 from src.utils.audit_log import audit
 from src.ingestion.pumpfun import PumpFunIngester
+from src.ingestion.vybe import VybeClient
 from src.execution.paper import PaperExecutor
 from src.execution.live import LiveExecutor
 from src.execution.jupiter import JupiterClient
@@ -51,6 +53,7 @@ class OxaniqAgent:
         self.call_mode = getattr(self.config, "call_mode", "trade")
         self.live = None  # set after helius
         self.ingester = PumpFunIngester(self.config)
+        self.vybe = VybeClient(self.config)
         self.executor = PaperExecutor(
             self.portfolio,
             fee_bps=getattr(self.config, "platform_fee_bps", 50),
@@ -80,6 +83,9 @@ class OxaniqAgent:
         return str(user_id) in admins
 
 
+    def _esc(self, value) -> str:
+        return html.escape(str(value or ""), quote=False)
+
     def _share_keyboard(self, symbol: str, mint: str, score_line: str) -> dict:
         pump = f"https://pump.fun/coin/{mint}"
         dex = f"https://dexscreener.com/solana/{mint}"
@@ -94,15 +100,111 @@ class OxaniqAgent:
                 ],
                 [
                     {"text": "Pump.fun", "url": pump},
-                    {"text": "DexScreener", "url": dex},
+                    {"text": "Chart", "url": dex},
+                ],
+                [
+                    {"text": "Unlock $11.99", "callback_data": "pay:info"},
                 ],
             ]
         }
 
-    async def _alert(self, text: str, reply_markup=None):
-        if self.tg.enabled:
+    async def _coin_image(self, token) -> str:
+        raw = token.raw or {}
+        img = token.image_uri or raw.get("image") or raw.get("image_uri") or ""
+        if isinstance(img, str) and img.startswith("http"):
+            return img
+        uri = raw.get("uri") or ""
+        if isinstance(uri, str) and uri.startswith("http") and any(uri.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            return uri
+        if isinstance(uri, str) and uri.startswith("http"):
             try:
-                await self.tg.send(text, reply_markup=reply_markup)
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(uri, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                        if r.status == 200 and "json" in (r.headers.get("content-type") or ""):
+                            meta = await r.json()
+                            pic = meta.get("image") or ""
+                            if isinstance(pic, str) and pic.startswith("http"):
+                                return pic
+            except Exception:
+                pass
+        return ""
+
+    def _pay_keyboard(self) -> dict:
+        return {"inline_keyboard": [[{"text": "Unlock $11.99", "callback_data": "pay:info"}]]}
+
+    def _holders_keyboard(self) -> dict:
+        on = getattr(self.scanner, "reject_concentrated", True)
+        pct = int(getattr(self.scanner, "max_top10_pct", 70))
+        def mark(label, active):
+            return f"✓ {label}" if active else label
+        return {"inline_keyboard": [
+            [
+                {"text": mark(">20%", on and pct == 20), "callback_data": "holders:20"},
+                {"text": mark(">30%", on and pct == 30), "callback_data": "holders:30"},
+                {"text": mark(">50%", on and pct == 50), "callback_data": "holders:50"},
+            ],
+            [
+                {"text": mark(">70%", on and pct == 70), "callback_data": "holders:70"},
+                {"text": mark("Off", not on), "callback_data": "holders:off"},
+            ],
+        ]}
+
+
+    def _welcome_text(self) -> str:
+        return (
+            "<b>OxanIQ</b> — Solana call desk\n"
+            "<i>Pump.fun launches. Scored. Capped. Shared.</i>\n\n"
+            "<b>How it works</b>\n"
+            "1. Live feed watches new launches\n"
+            "2. Score + risk gates filter the noise\n"
+            "3. Calls land here with chart links\n\n"
+            "<b>Free desk</b>\n"
+            "Calls, status, feed, and your wallet are free.\n"
+            "1 Jupiter quote a day.\n\n"
+            "<b>Unlock</b>\n"
+            "/pay — $11.99 in SOL, one time.\n"
+            "Unlimited quotes, withdraws, and the full desk.\n\n"
+            "Tap /help for commands."
+        )
+
+    def _help_text(self) -> str:
+        return (
+            "<b>OxanIQ</b>\n"
+            "Calls are free to watch. Unlock the desk for $11.99.\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>Start here</b>\n"
+            "/pay — SOL amount and vault\n"
+            "/verify — paste your tx to unlock\n"
+            "/wallet — your deposit address\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>Desk</b>\n"
+            "/status — cash and PnL\n"
+            "/calls — calls left today\n"
+            "/feed — launch source\n"
+            "/quote — price a mint (1 free / day)\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>Wallet</b>\n"
+            "/balance — SOL and USDC\n"
+            "/withdraw — paid only\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>More</b>\n"
+            "/pos · /trades · /health · /slot"
+        )
+
+    async def _alert(self, text: str, reply_markup=None, parse_mode=None, photo=None, also_channel: bool = False):
+        if not self.tg.enabled:
+            return
+        targets = [None]  # group / default chat
+        if also_channel and getattr(self.tg, "channel_id", None):
+            targets.append(self.tg.channel_id)
+        for cid in targets:
+            try:
+                if photo:
+                    ok = await self.tg.send_photo(photo, text, chat_id=cid, reply_markup=reply_markup, parse_mode=parse_mode or "HTML")
+                    if ok:
+                        continue
+                await self.tg.send(text, chat_id=cid, reply_markup=reply_markup, parse_mode=parse_mode)
             except Exception:
                 pass
 
@@ -121,11 +223,7 @@ class OxaniqAgent:
         self.tg.set_command_handler(self._on_tg_command)
         if self.tg.enabled:
             await self.tg.start_polling()
-            await self.tg.send(
-                "OxanIQ up (PAPER).\n"
-                f"TP {r.take_profit_pct*100:.0f}% / SL {r.stop_loss_pct*100:.0f}% / hold {r.max_hold_seconds}s\n"
-                "/help for commands"
-            )
+            await self.tg.send(self._welcome_text(), parse_mode="HTML", reply_markup=self._pay_keyboard())
             logger.info("Telegram control enabled")
         await self.ingester.start()
         self.running = True
@@ -187,6 +285,31 @@ class OxaniqAgent:
                 for k in ("top10_holder_pct", "holder_count", "buy_count", "tx_count"):
                     if k in tok.raw:
                         extra[k] = tok.raw[k]
+            if getattr(self, "vybe", None) and self.vybe.enabled and tok.mint and not tok.mint.startswith("Mock"):
+                try:
+                    info = await self.vybe.token(tok.mint)
+                    if info:
+                        tok.raw = {**(tok.raw or {}), "vybe": info}
+                        if info.get("price"):
+                            extra["vybe_price"] = info.get("price")
+                        holders = info.get("holderCount") or info.get("holders")
+                        if holders:
+                            extra["holder_count"] = holders
+                    th = await self.vybe.top_holders(tok.mint)
+                    if th:
+                        rows = th.get("data") or th.get("holders") or th.get("topHolders") or []
+                        if isinstance(rows, list) and rows:
+                            top = 0.0
+                            for row in rows[:10]:
+                                try:
+                                    top += float(row.get("percentage") or row.get("pct") or row.get("share") or 0)
+                                except Exception:
+                                    pass
+                            if top:
+                                extra["top10_holder_pct"] = top
+                                tok.raw["top10_holder_pct"] = top
+                except Exception as e:
+                    logger.debug(f"vybe enrich skip: {e}")
             intensity = min(0.9, (tok.virtual_sol_reserves or 1) / 20.0)
             sig = self.scorer.score(tok, fomo_score=intensity, extra=extra)
             candidates.append(sig)
@@ -194,15 +317,31 @@ class OxaniqAgent:
         accepted = self.scanner.consider(candidates, killed=self.risk.killed)
         for sig, call_reason in accepted:
             left = self.scanner.remaining
+            tok = sig.token
+            raw = tok.raw or {}
+            mc = tok.market_cap_sol or raw.get("marketCapSol")
+            vs = tok.virtual_sol_reserves or raw.get("vSolInBondingCurve")
+            dev = raw.get("initialQuoteAmount") or raw.get("solAmount")
+            mc_s = f"{float(mc):.1f} SOL" if mc else "n/a"
+            vs_s = f"{float(vs):.2f} SOL" if vs else "n/a"
+            dev_s = f"{float(dev):.2f} SOL" if dev else "n/a"
             call_text = (
-                f"CALL {sig.token.symbol}\n"
-                f"{call_reason}\n"
-                f"mint={sig.token.mint}\n"
-                f"mode={self.call_mode}\n"
-                f"calls left today: {left}"
+                f"<b>CALL ${self._esc(tok.symbol)}</b>\n"
+                f"{self._esc(tok.name)}\n\n"
+                f"<b>Score</b> {self._esc(call_reason)}\n"
+                f"<b>Price</b> {self._esc(((tok.raw or {}).get('vybe') or {}).get('price') or 'n/a')}\n"
+                f"<b>MC</b> {self._esc(mc_s)}\n"
+                f"<b>Curve</b> {self._esc(vs_s)}\n"
+                f"<b>Dev buy</b> {self._esc(dev_s)}\n"
+                f"<b>Holders</b> {self._esc((tok.raw or {}).get('holder_count') or 'n/a')}"
+                f" · <b>Top10</b> {self._esc(round(float((tok.raw or {}).get('top10_holder_pct') or 0), 1) if (tok.raw or {}).get('top10_holder_pct') else 'n/a')}%\n"
+                f"<b>Mint</b> <code>{self._esc(tok.mint)}</code>\n"
+                f"<b>Mode</b> {self._esc(self.call_mode)} · <b>Left</b> {left}\n\n"
+                f"<i>Free to watch. /pay unlocks quotes + withdraws.</i>"
             )
-            kb = self._share_keyboard(sig.token.symbol, sig.token.mint, call_reason)
-            await self._alert(call_text, reply_markup=kb)
+            kb = self._share_keyboard(tok.symbol, tok.mint, call_reason)
+            photo = await self._coin_image(tok)
+            await self._alert(call_text, reply_markup=kb, parse_mode="HTML", photo=photo or None, also_channel=True)
             if self.call_mode != "trade":
                 continue
             # access gate is per-user at command time; paper loop stays operator-side
@@ -277,45 +416,73 @@ class OxaniqAgent:
             )
 
     async def _on_tg_command(self, cmd: str, chat_id: str, raw: str = "", user_id: str = ""):
-        parts = (raw or cmd).strip().split()
-        cmd0 = (parts[0] if parts else cmd).lower().split("@")[0]
-        args = parts[1:] if len(parts) > 1 else []
+        # Callbacks arrive as cmd="/cb" and raw="pay:info" / "live:on".
+        # Do not let raw overwrite the command name.
+        if cmd == "/cb":
+            cmd0 = "/cb"
+            args = (raw or "").split(":")[1:]
+        else:
+            parts = (raw or cmd).strip().split()
+            cmd0 = (parts[0] if parts else cmd).lower().split("@")[0]
+            args = parts[1:] if len(parts) > 1 else []
 
         async def reply(msg: str):
             await self.tg.send(msg, chat_id=chat_id)
 
         admin = self._is_admin(user_id) if user_id else self._is_admin(None)
-        if getattr(self.config, "access_required", True) and not admin and user_id and not self.access.is_paid(user_id):
-            if cmd0 in ("/withdraw", "/quote", "/calls"):
-                await reply("Locked. Send /pay to unlock ($11.99 in SOL).")
+        paid = admin or (user_id and self.access.is_paid(user_id))
+        if getattr(self.config, "access_required", True) and not paid:
+            if cmd0 == "/quote":
+                limit = getattr(self.config, "free_quotes_per_day", 1)
+                if not self.access.free_quote_ok(user_id or "anon", limit):
+                    await reply("Free quote used today.\n/pay unlocks unlimited quotes ($11.99).")
+                    return
+            elif cmd0 in ("/withdraw", "/jup", "/x402", "/live"):
+                await reply("Paid desk only.\n/pay — $11.99 in SOL, one time.\nFree: /status /feed /calls /wallet /quote (1/day)")
                 return
 
         if cmd0 in ("/help", "/start"):
-            await reply(
-                "OxanIQ commands\n────────────\n"
-                "/status /pos /trades /risk /feed /calls\n"
-                "/health /slot /jup /x402\n/quote <mint>\n"
-                "/wallet /deposit /balance /usdc /pay /verify\n"
-                "/withdraw sol|usdc <amt> <addr> confirm\n"
-                "/live /kill /revive (admin if allowlist)\n"
-                "/set risk <key> <val> (admin)\n"
-                "/sellall confirm /shutdown confirm (admin)\n/help"
-            )
+            text = self._help_text()
+            if admin:
+                text += (
+                    "\n━━━━━━━━━━━━━━━━\n"
+                    "<b>Admin</b>\n"
+                    "/live — paper or live\n"
+                    "/kill — stop calls\n"
+                    "/revive — resume\n"
+                    "/calls mode alert|trade"
+                )
+            await self.tg.send(text, chat_id=chat_id, parse_mode="HTML", reply_markup=self._pay_keyboard())
             return
         if cmd0 == "/status":
             open_n = sum(1 for p in self.portfolio.positions.values() if p.status == "open")
-            await reply(
-                f"OxanIQ status\nmode={'PAPER' if self.config.paper_trading else 'LIVE'}\n"
-                f"cycle={self.cycle}\ncash={self.portfolio.cash_sol:.4f} SOL\nopen={open_n}\n"
-                f"daily_pnl={self.portfolio.daily_pnl_sol:+.4f}\ntotal_pnl={self.portfolio.total_pnl_sol:+.4f}\n"
-                f"trades={len(self.portfolio.trades)}\nkilled={self.risk.killed}\n"
-                f"feed={getattr(self.ingester, 'last_source', '?')}\n"                f"fees={self.executor.total_fees_sol:.4f} SOL"
+            mode = "PAPER" if self.config.paper_trading else "LIVE"
+            await self.tg.send(
+                f"<b>Status</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>Mode</b> {mode}\n"
+                f"<b>Cash</b> {self.portfolio.cash_sol:.4f} SOL\n"
+                f"<b>Open</b> {open_n}\n"
+                f"<b>Daily PnL</b> {self.portfolio.daily_pnl_sol:+.4f} SOL\n"
+                f"<b>Total PnL</b> {self.portfolio.total_pnl_sol:+.4f} SOL\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>Trades</b> {len(self.portfolio.trades)}\n"
+                f"<b>Feed</b> {getattr(self.ingester, 'last_source', '?')}\n"
+                f"<b>Fees</b> {self.executor.total_fees_sol:.4f} SOL\n"
+                f"<b>Kill</b> {'on' if self.risk.killed else 'off'}",
+                chat_id=chat_id,
+                parse_mode="HTML",
             )
             return
         if cmd0 == "/feed":
-            await reply(
-                f"Launch feed\nsource={getattr(self.ingester, 'last_source', '?')}\n"
-                f"last_count={getattr(self.ingester, 'last_count', 0)}\napi={self.config.pumpfun_api}"
+            await self.tg.send(
+                f"<b>Feed</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>Source</b> {getattr(self.ingester, 'last_source', '?')}\n"
+                f"<b>Last batch</b> {getattr(self.ingester, 'last_count', 0)}\n"
+                f"<b>PumpDev</b> {'on' if getattr(self.ingester, 'pumpdev', None) and self.ingester.pumpdev.connected else 'connecting'}",
+                chat_id=chat_id,
+                parse_mode="HTML",
             )
             return
         if cmd0 == "/calls":
@@ -331,38 +498,46 @@ class OxaniqAgent:
                 await reply(f"Call mode = {mode}")
                 return
             st = self.scanner.status()
-            await reply(
-                f"Call budget\n"
-                f"day={st['day']}\n"
-                f"used={st['used']}/{st['max']}\n"
-                f"remaining={st['remaining']}\n"
-                f"mode={self.call_mode}\n"
-                f"min_score={self.scanner.min_score}\n"
-                f"min_conf={self.scanner.min_confidence}\n"
-                f"curve={self.scanner.min_curve_sol}-{self.scanner.max_curve_sol} SOL"
+            if self.scanner.reject_concentrated:
+                hold = f">{int(self.scanner.max_top10_pct)}%"
+            else:
+                hold = "off"
+            await self.tg.send(
+                f"<b>Calls</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>Today</b> {st['used']}/{st['max']}\n"
+                f"<b>Left</b> {st['remaining']}\n"
+                f"<b>Mode</b> {self.call_mode}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>Min score</b> {self.scanner.min_score}\n"
+                f"<b>Curve</b> {self.scanner.min_curve_sol}-{self.scanner.max_curve_sol} SOL\n"
+                f"<b>Holder reject</b> {hold}",
+                chat_id=chat_id,
+                parse_mode="HTML",
+                reply_markup=self._holders_keyboard(),
             )
             return
         if cmd0 in ("/pos", "/positions"):
             open_pos = [p for p in self.portfolio.positions.values() if p.status == "open"]
             if not open_pos:
-                await reply("No open positions.")
+                await self.tg.send("<b>Positions</b>\n━━━━━━━━━━━━━━━━\nNone open.", chat_id=chat_id, parse_mode="HTML")
                 return
-            lines = ["Open positions"] + [
-                f"• {p.symbol} | {p.size_sol:.4f} SOL | {p.tokens_held:.0f} tok" for p in open_pos
-            ]
-            await reply("\n".join(lines))
+            lines = ["<b>Positions</b>", "━━━━━━━━━━━━━━━━"]
+            for p in open_pos:
+                lines.append(f"<b>{self._esc(p.symbol)}</b> · {p.size_sol:.4f} SOL · {p.tokens_held:.0f} tok")
+            await self.tg.send("\n".join(lines), chat_id=chat_id, parse_mode="HTML")
             return
         if cmd0 == "/trades":
             trades = self.portfolio.trades[-8:]
             if not trades:
-                await reply("No trades yet.")
+                await self.tg.send("<b>Trades</b>\n━━━━━━━━━━━━━━━━\nNone yet.", chat_id=chat_id, parse_mode="HTML")
                 return
-            lines = ["Last trades"]
-            for t in reversed(trades):
-                side = t.side.value if hasattr(t.side, "value") else str(t.side)
-                pnl = f" pnl={t.pnl_sol:+.4f}" if t.pnl_sol is not None else ""
-                lines.append(f"• {side.upper()} {t.symbol} {t.size_sol:.4f} SOL{pnl}")
-            await reply("\n".join(lines))
+            lines = ["<b>Trades</b>", "━━━━━━━━━━━━━━━━"]
+            for tr in reversed(trades):
+                side = tr.side.value if hasattr(tr.side, "value") else str(tr.side)
+                pnl = f" · {tr.pnl_sol:+.4f}" if tr.pnl_sol is not None else ""
+                lines.append(f"{side.upper()} <b>{self._esc(tr.symbol)}</b> · {tr.size_sol:.4f} SOL{pnl}")
+            await self.tg.send("\n".join(lines), chat_id=chat_id, parse_mode="HTML")
             return
         if cmd0 == "/risk":
             r = self.config.risk
@@ -443,7 +618,16 @@ class OxaniqAgent:
             return
         if cmd0 == "/quote":
             if not args:
-                await reply("Usage: /quote <mint>")
+                await self.tg.send(
+                    "<b>Quote</b>\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    "Send a mint after the command.\n"
+                    "<code>/quote <mint></code>\n\n"
+                    "Free: 1 quote a day.\n"
+                    "Paid: unlimited.",
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                )
                 return
             try:
                 q = await self.jupiter.quote_sol_to_token(args[0], 0.01, slippage_bps=300)
@@ -596,9 +780,19 @@ class OxaniqAgent:
             except Exception as e:
                 await reply(f"Withdraw failed: {e}")
             return
-        if cmd0 in ("/live", "/live_cb"):
-            if cmd0 == "/live_cb":
-                action = (raw or "").split(":")[-1]
+        if cmd0 == "/cb" and (raw or "").startswith("pay:"):
+            amt = await self.access.sol_amount()
+            amt_s = f"{amt} SOL" if amt else "SOL price loading"
+            await reply(
+                f"Unlock OxanIQ — ${self.access.price_usd}\n"
+                f"Send {amt_s} to:\n{self.access.vault}\n\n"
+                f"Then /verify <tx_signature>\n"
+                f"Free desk stays open either way."
+            )
+            return
+        if cmd0 in ("/live", "/live_cb", "/cb"):
+            if raw and raw.startswith("live:"):
+                action = raw.split(":")[-1]
             else:
                 action = args[0].lower() if args else ""
             live_on = bool(getattr(self.config, "live_enabled", False))

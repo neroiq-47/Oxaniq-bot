@@ -1,0 +1,34 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs & data
+logs/
+data/
+*.log
+
+# Node leftovers
+node_modules/
+package-lock.json
+data/
+*.pyc
